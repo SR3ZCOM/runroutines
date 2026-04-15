@@ -1,7 +1,7 @@
 use crossbeam_deque::{Injector, Worker, Stealer, Steal};
 use crossbeam_queue::SegQueue;
 
-use std::{thread, sync::{Arc, Once}};
+use std::{thread, sync::{Arc, Once}};//, atomic::{AtomicUsize, Ordering}}};
 
 type TaskFn = unsafe extern "C" fn(*mut ());
 
@@ -25,6 +25,7 @@ struct Context {
 }
 
 #[allow(unused)]
+#[repr(C)]
 pub struct RunroutineStruct {
   rsp: usize,
   stack: Vec<u8>,
@@ -55,13 +56,15 @@ struct SharedP {
   id: usize,
   stealer: Stealer<GPtr>,
 }
-
 static RUNTIME_INIT: Once = Once::new();
 static GLOBAL_QUEUE: once_cell::sync::Lazy<Injector<GPtr>> = once_cell::sync::Lazy::new(Injector::new);
+static HANDLES: once_cell::sync::Lazy<SegQueue<thread::Thread>> = once_cell::sync::Lazy::new(SegQueue::new);
 
 thread_local! {
   static SCHED_CTX: std::cell::UnsafeCell<Context> = std::cell::UnsafeCell::new(Context::default());
   static CURRENT: std::cell::Cell<*mut Context> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+  static LOCAL: Worker<GPtr> = Worker::new_fifo();
+  static SCHED_RSP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // ################################################################################################################################################################
@@ -87,17 +90,19 @@ impl RunroutineStruct {
         sp = sp.offset(-1);
         *sp = 0;
       }
-
       let runroutine = Box::into_raw(Box::new(RunroutineStruct {
         rsp: sp as usize,
         stack,
       }));
       GLOBAL_QUEUE.push(GPtr(runroutine));
+
+      if let Some(t) = HANDLES.pop() {
+        t.unpark();
+        HANDLES.push(t);
+      }
     }
   }
 }
-
-thread_local! { static LOCAL: Worker<GPtr> = Worker::new_fifo(); }
 
 // ################################################################################################################################################################
 fn fetch_task(local: &Worker<GPtr>) -> Option<GPtr> {
@@ -122,10 +127,6 @@ unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
   println!("shim_completed");
 }
 
-thread_local! {
-  static SCHED_RSP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 // ################################################################################################################################################################
 /// # Safety
 ///
@@ -133,22 +134,22 @@ thread_local! {
 unsafe extern "C" fn ret_to_sched() {
   unsafe {
     let s_rsp_ptr = SCHED_RSP.with(|r| r.get()) as *mut usize;
-    if s_rsp_ptr.is_null() { return; }
 
+    if s_rsp_ptr.is_null() { return; }
     let s_rsp = *s_rsp_ptr;
-    let mut dummy = 0;
-    swap_stack(&mut dummy, s_rsp);
+    let mut discard_stack: usize = 0;
+
+    swap_stack(&mut discard_stack, s_rsp);
   }
 }
 
 // ################################################################################################################################################################
 fn scheduler_loop() {
   let mut sched_rsp: usize = 0;
+  HANDLES.push(thread::current());
 
   loop {
-    let task = LOCAL.with(fetch_task);
-
-    if let Some(g) = task {
+    if let Some(g) = LOCAL.with(fetch_task) {
       unsafe {
         let ptask = g.0;
         SCHED_RSP.with(|r| r.set(&mut sched_rsp as *mut usize as usize));
@@ -157,7 +158,7 @@ fn scheduler_loop() {
         let _ = Box::from_raw(ptask);
       }
     } else {
-      std::hint::spin_loop();
+      thread::park();
     }
   }
 }

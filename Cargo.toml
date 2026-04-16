@@ -8,6 +8,7 @@ rustc_version = "0.4"
 cc = "*"
 
 [dependencies]
+log = "0.4"
 rustc_version = "0.4"
 crossbeam-deque = "*"
 crossbeam-queue = "*"

@@ -1,4 +1,4 @@
-use crossbeam_deque::{Injector, Worker, Stealer, Steal};
+use crossbeam_deque::{Injector, Worker, Stealer/*, Steal*/};
 use crossbeam_queue::SegQueue;
 
 use std::{thread, sync::{Arc, Once}};//, atomic::{AtomicUsize, Ordering}}};
@@ -38,20 +38,7 @@ unsafe impl Send for GPtr {}
 unsafe impl Sync for GPtr {}
 
 #[allow(unused)]
-#[derive(Debug)]
-struct Scheduler {
-  global: SegQueue<GPtr>,
-  stealers: Vec<SharedP>,
-}
-
-#[allow(unused)]
-struct P {
-  id: usize,
-  runq: Worker<GPtr>,
-}
-
-#[allow(unused)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SharedP {
   id: usize,
   stealer: Stealer<GPtr>,
@@ -62,9 +49,9 @@ static HANDLES: once_cell::sync::Lazy<SegQueue<thread::Thread>> = once_cell::syn
 
 thread_local! {
   static SCHED_CTX: std::cell::UnsafeCell<Context> = std::cell::UnsafeCell::new(Context::default());
-  static CURRENT: std::cell::Cell<*mut Context> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-  static LOCAL: Worker<GPtr> = Worker::new_fifo();
   static SCHED_RSP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  static CURRENT_TASK: std::cell::Cell<*mut RunroutineStruct> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+  static LOCAL_WORKER: std::cell::Cell<*const Worker<GPtr>> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 // ################################################################################################################################################################
@@ -105,26 +92,14 @@ impl RunroutineStruct {
 }
 
 // ################################################################################################################################################################
-fn fetch_task(local: &Worker<GPtr>) -> Option<GPtr> {
-  if let Some(g) = local.pop() {
-    return Some(g);
-  }
-
-  if let Steal::Success(g) = GLOBAL_QUEUE.steal() {
-    return Some(g);
-  }
-  None
-}
-
-// ################################################################################################################################################################
 unsafe extern "C" { fn swap_stack(old_sp: *mut usize, new_sp: usize); }
 
 // ################################################################################################################################################################
 #[unsafe(no_mangle)]
 unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
-  println!("shim_started");
+  log::info!("shim_started");
   unsafe { func(data); }
-  println!("shim_completed");
+  log::info!("shim_completed");
 }
 
 // ################################################################################################################################################################
@@ -133,29 +108,66 @@ unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ret_to_sched() {
   unsafe {
-    let s_rsp_ptr = SCHED_RSP.with(|r| r.get()) as *mut usize;
+    let ptask = CURRENT_TASK.with(|c| c.get());
+    let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
 
-    if s_rsp_ptr.is_null() { return; }
-    let s_rsp = *s_rsp_ptr;
+    if ptask.is_null() || psched_rsp.is_null() { return; }
+
+    let sched_rsp = *psched_rsp;
     let mut discard_stack: usize = 0;
 
-    swap_stack(&mut discard_stack, s_rsp);
+    (*ptask).rsp = 0;
+    swap_stack(&mut discard_stack, sched_rsp);
   }
 }
 
 // ################################################################################################################################################################
-fn scheduler_loop() {
+pub fn back_yield() {
+  let ptask = CURRENT_TASK.with(|c| c.get());
+  if ptask.is_null() { return; }
+
+  unsafe {
+    LOCAL_WORKER.with(|w| {
+      let ptr = w.get();
+
+      if ! ptr.is_null() {
+        (*ptr).push(GPtr(ptask));
+      } else {
+        GLOBAL_QUEUE.push(GPtr(ptask));
+      }
+    });
+    let pshed_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
+
+    if pshed_rsp.is_null() { return; }
+
+    let sched_rsp = *pshed_rsp;
+    swap_stack(&mut (*ptask).rsp, sched_rsp);
+  }
+}
+
+// ################################################################################################################################################################
+fn scheduler_loop(id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
   let mut sched_rsp: usize = 0;
+  let peers: Vec<Stealer<GPtr>> = stealers.iter().filter(|s| s.id != id).map(|s| s.stealer.clone()).collect();
+
   HANDLES.push(thread::current());
+  LOCAL_WORKER.with(|w| w.set(&local as *const Worker<GPtr>));
 
   loop {
-    if let Some(g) = LOCAL.with(fetch_task) {
+    if let Some(task) = local.pop().or_else(|| { GLOBAL_QUEUE.steal_batch_and_pop(&local).success() })
+      .or_else(|| { peers.iter().find_map(|s| s.steal().success()) }) {
       unsafe {
-        let ptask = g.0;
+        let ptask = task.0;
+        CURRENT_TASK.with(|c| c.set(ptask));
         SCHED_RSP.with(|r| r.set(&mut sched_rsp as *mut usize as usize));
         swap_stack(&mut sched_rsp, (*ptask).rsp);
-        println!("SCHED RESUMED SUCCESSFULLY");
-        let _ = Box::from_raw(ptask);
+        CURRENT_TASK.with(|c| c.set(std::ptr::null_mut()));
+        log::info!("sched resumed successfully");
+
+        if 0 == (*ptask).rsp {
+          log::info!("{} drop task", id);
+          let _ = Box::from_raw(ptask);
+        }
       }
     } else {
       thread::park();
@@ -166,30 +178,28 @@ fn scheduler_loop() {
 // ################################################################################################################################################################
 pub fn build_runtime(mut n: usize) {
   RUNTIME_INIT.call_once(|| {
-    if 0 == n {
+    if 0 == n || n > 4 {
       n = thread::available_parallelism().map(|n| n.get()).unwrap_or(RR_THREADS_COUNT);
     }
     let mut stealers = Vec::new();
-    let mut ps = Vec::new();
+    let mut workers = Vec::new();
 
     for i in 0..n {
       let worker = Worker::new_fifo();
-
       stealers.push(SharedP { id: i, stealer: worker.stealer() });
-      ps.push(P { id: i, runq: worker });
+      workers.push(worker);
     }
-    let sched = Arc::new(Scheduler {
-      global: SegQueue::new(),
-      stealers,
-    });
+    let shared_stealers = Arc::new(stealers);
 
-    for _ in 0..n {
-      let _ = Arc::clone(&sched);
-      std::thread::spawn(move || {
-        scheduler_loop();
+    for i in 0..n {
+      let local = workers.remove(0);
+      let s_clone = Arc::clone(&shared_stealers);
+
+      thread::spawn(move || {
+        scheduler_loop(i, s_clone, local);
       });
     }
-    println!("🚀 RunRoutines runtime started with {} worker threads", n);
+    log::info!("🚀 RunRoutines runtime started with {} worker threads", n);
   });
 }
 

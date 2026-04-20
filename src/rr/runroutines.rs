@@ -1,9 +1,18 @@
 use std::{thread, time::{Instant, Duration}, sync::{Arc, Once}, collections::BinaryHeap, cmp::Ordering};//, atomic::{AtomicUsize, Ordering}}};
 use crossbeam_deque::{Injector, Worker, Stealer/*, Steal*/};
 use crossbeam_queue::SegQueue;
-use std::collections::HashMap;
-use std::sync::Mutex;
-use libc::{epoll_create1, epoll_ctl, epoll_wait, EPOLL_CTL_DEL, EPOLL_CTL_ADD, epoll_event, EPOLLIN};
+use libc::{epoll_wait, epoll_event, epoll_create1, epoll_ctl, /*EPOLL_CTL_DEL, */EPOLL_CTL_ADD, EPOLLIN, read, EAGAIN};
+
+pub const NC: &str = "\x1b[0m"; // NO_COLOR
+pub const DRED: &str = "\x1b[31m";
+pub const RED: &str = "\x1b[91m";
+pub const DGREEN: &str = "\x1b[32m";
+pub const GREEN: &str = "\x1b[92m";
+pub const DYELLOW: &str = "\x1b[33m";
+pub const YELLOW: &str = "\x1b[93m";
+pub const MAG: &str = "\x1b[95m";
+pub const DCYAN: &str = "\x1b[36m";
+pub const CYAN: &str = "\x1b[96m";
 
 type TaskFn = unsafe extern "C" fn(*mut ());
 
@@ -66,16 +75,15 @@ impl PartialOrd for TimerTask {
 }
 static RUNTIME_INIT: Once = Once::new();
 static GLOBAL_QUEUE: once_cell::sync::Lazy<Injector<GPtr>> = once_cell::sync::Lazy::new(Injector::new);
-static HANDLES: once_cell::sync::Lazy<SegQueue<thread::Thread>> = once_cell::sync::Lazy::new(SegQueue::new);
-static TIMERS: once_cell::sync::Lazy<std::sync::Mutex<BinaryHeap<TimerTask>>> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(BinaryHeap::new()));
-static WAITING_TASKS: once_cell::sync::Lazy<Mutex<HashMap<i32, GPtr>>> = once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
-static EPOLL_FD: once_cell::sync::Lazy<i32> = once_cell::sync::Lazy::new(|| unsafe { let fd = epoll_create1(0); if fd < 0 { eprintln!("❌ create_epoll_error"); } fd });
+static GLOBAL_MACHINES: once_cell::sync::Lazy<SegQueue<thread::Thread>> = once_cell::sync::Lazy::new(SegQueue::new);
 
 thread_local! {
   static SCHED_RSP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
   static CURRENT_TASK: std::cell::Cell<*mut RunroutineStruct> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-  static LOCAL_WORKER: std::cell::Cell<*const Worker<GPtr>> = const { std::cell::Cell::new(std::ptr::null()) };
+  static WORKER: std::cell::Cell<*const Worker<GPtr>> = const { std::cell::Cell::new(std::ptr::null()) };
   static TICK_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+  static TIMERS: std::cell::RefCell<BinaryHeap<TimerTask>> = const { std::cell::RefCell::new(BinaryHeap::new()) };
+  static EPOLL_FD: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
 }
 
 #[macro_export]
@@ -83,7 +91,7 @@ macro_rules! rr_println {
   ($($arg:tt)*) => {{
     println!($($arg)*);
     // sleep_yield(1);
-    back_yield();
+    arbit_yield();
   }};
 }
 
@@ -108,11 +116,106 @@ pub fn build_runtime(mut n: usize) {
       let s_clone = Arc::clone(&shared_stealers);
 
       thread::spawn(move || {
-        scheduler_loop(i, s_clone, local);
+        schedule(i, s_clone, local);
       });
     }
-    eprintln!("🚀 RunRoutines runtime started with {} worker threads 🔥", n);
+    eprintln!("🚀 {}RunRoutines runtime started with {} worker threads{} 🔥", GREEN, n, NC);
   });
+}
+
+// ################################################################################################################################################################
+pub fn async_read(fd: i32, buf: &mut [u8]) -> isize {
+  loop {
+    let n = unsafe {
+      read(fd, buf.as_mut_ptr() as *mut _, buf.len())
+    };
+
+    if n >= 0 {
+      return n;
+    }
+    let err = std::io::Error::last_os_error();
+
+    match err.raw_os_error() {
+      Some(EAGAIN) /*| Some(EWOULDBLOCK) */ => {
+        wait_for_fd(fd);
+
+        continue;
+      }
+      _ => return -1,
+    }
+  }
+}
+
+// ################################################################################################################################################################
+pub fn sleep_yield(ms: u64) {
+  let ptask = CURRENT_TASK.with(|c| c.get());
+
+  if ptask.is_null() { return; }
+
+  let wake_at = Instant::now() + Duration::from_millis(ms);
+
+  TIMERS.with(|timers| {
+    timers.borrow_mut().push(TimerTask {
+      when: wake_at,
+      task: GPtr(ptask),
+    });
+  });
+  eprintln!("sleep_yield: pushed: {:?}", wake_at);
+
+  unsafe {
+    let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
+
+    if psched_rsp.is_null() { return; }
+
+    swap_stack(&mut (*ptask).rsp, *psched_rsp);
+  }
+}
+
+// ################################################################################################################################################################
+pub fn arbit_yield() {
+  let ptask = CURRENT_TASK.with(|c| c.get());
+
+  if ptask.is_null() { return; }
+
+  unsafe {
+    WORKER.with(|w| {
+      let ptr = w.get();
+
+      if ! ptr.is_null() {
+        (*ptr).push(GPtr(ptask));
+        eprintln!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
+      } else {
+        GLOBAL_QUEUE.push(GPtr(ptask));
+        eprintln!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
+      }
+    });
+    let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
+
+    if psched_rsp.is_null() { return; }
+
+    swap_stack(&mut (*ptask).rsp, *psched_rsp);
+  }
+}
+
+// ################################################################################################################################################################
+pub fn wait_for_fd(fd: i32) {
+  let ptask = CURRENT_TASK.with(|c| c.get());
+
+  if ptask.is_null() { return; }
+
+  let mut ev = epoll_event {
+    events: EPOLLIN as u32,
+    u64: ptask as u64,
+  };
+
+  unsafe {
+    epoll_ctl(fd, EPOLL_CTL_ADD, fd, &mut ev);
+    let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
+
+    if ! psched_rsp.is_null() {
+      swap_stack(&mut (*ptask).rsp, *psched_rsp);
+    }
+  }
 }
 
 // ################################################################################################################################################################
@@ -138,16 +241,13 @@ impl RunroutineStruct {
         sp = sp.offset(-1);
         *sp = 0;
       }
-      let runroutine = Box::into_raw(Box::new(RunroutineStruct {
-        rsp: sp as usize,
-        stack,
-      }));
-      GLOBAL_QUEUE.push(GPtr(runroutine));
-      eprintln!("add: pushed_to_global: {}", GLOBAL_QUEUE.len());
+      GLOBAL_QUEUE.push(GPtr(Box::into_raw(Box::new(RunroutineStruct { rsp: sp as usize, stack }))));
 
-      if let Some(t) = HANDLES.pop() {
+      eprintln!("add: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
+
+      if let Some(t) = GLOBAL_MACHINES.pop() {
         t.unpark();
-        HANDLES.push(t);
+        GLOBAL_MACHINES.push(t);
       }
     }
   }
@@ -164,9 +264,8 @@ unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
   eprintln!("shim: completed");
 }
 
-// ################################################################################################################################################################
 /// # Safety
-///
+// ################################################################################################################################################################
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ret_to_sched() {
   unsafe {
@@ -183,98 +282,72 @@ unsafe extern "C" fn ret_to_sched() {
 }
 
 // ################################################################################################################################################################
-pub fn sleep_yield(ms: u64) {
-  let ptask = CURRENT_TASK.with(|c| c.get());
+fn get_ready_timers(local: &Worker<GPtr>) -> u64 {
+  TIMERS.with(|timers| {
+    let mut timers = timers.borrow_mut();
+    let now = Instant::now();
 
-  if ptask.is_null() { return; }
-
-  let wake_at = Instant::now() + Duration::from_millis(ms);
-  let mut lock = match TIMERS.lock() {
-    Ok(guard) => guard,
-    Err(poisoned) => {
-      poisoned.into_inner()
-    },
-  };
-
-  lock.push(TimerTask {
-    when: wake_at,
-    task: GPtr(ptask),
-  });
-  drop(lock);
-  eprintln!("sleep_yield: pushed: {:?}", wake_at);
-
-  unsafe {
-    let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
-
-    if psched_rsp.is_null() { return; }
-
-    swap_stack(&mut (*ptask).rsp, *psched_rsp);
-  }
-}
-
-// ################################################################################################################################################################
-pub fn back_yield() {
-  let ptask = CURRENT_TASK.with(|c| c.get());
-
-  if ptask.is_null() { return; }
-
-  unsafe {
-    LOCAL_WORKER.with(|w| {
-      let ptr = w.get();
-
-      if ! ptr.is_null() {
-        (*ptr).push(GPtr(ptask));
-        eprintln!("back_yield: pushed_to_local: {}", (*ptr).len());
-      } else {
-        GLOBAL_QUEUE.push(GPtr(ptask));
-        eprintln!("back_yield: pushed_to_global: {}", GLOBAL_QUEUE.len());
-      }
-    });
-    let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
-
-    if psched_rsp.is_null() { return; }
-
-    swap_stack(&mut (*ptask).rsp, *psched_rsp);
-  }
-}
-
-// ################################################################################################################################################################
-pub fn wait_for_fd(fd: i32) {
-  let ptask = CURRENT_TASK.with(|c| c.get());
-  if ptask.is_null() || *EPOLL_FD < 0 { return; }
-
-  let mut ev = epoll_event {
-    events: (EPOLLIN as u32),
-    u64: fd as u64,
-  };
-
-  unsafe {
-    if 0 == epoll_ctl(*EPOLL_FD, EPOLL_CTL_ADD, fd, &mut ev) {
-      let mut lock = match WAITING_TASKS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    loop {
+      let expired = match timers.peek() {
+        Some(t) => t.when <= now,
+        None => false,
       };
-      lock.insert(fd, GPtr(ptask));
-      drop(lock);
 
-      let pshed_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
-
-      if ! pshed_rsp.is_null() {
-        swap_stack(&mut (*ptask).rsp, *pshed_rsp);
+      if ! expired {
+        break;
       }
-    } else {
-      eprintln!("❌ epoll_ctl_error_for_fd");
+
+      if let Some(tt) = timers.pop() {
+        local.push(tt.task);
+      } else {
+        break;
+      }
     }
+
+    match timers.peek() {
+      Some(next) => {
+        if next.when <= now {
+          0
+        } else {
+          next.when.saturating_duration_since(now).as_millis() as u64
+        }
+      }
+      None => 0,
+    }
+  })
+}
+
+// ################################################################################################################################################################
+fn handle_event(epfd: i32, local: &Worker<GPtr>) {
+  let mut events: [epoll_event; 64] = unsafe { std::mem::zeroed() };
+
+  let n = unsafe {
+    epoll_wait(epfd, events.as_mut_ptr(), 64, 0)
+  };
+
+  for event in events.iter().take(n.max(0) as usize) {
+  // for i in 0..n.max(0) as usize {
+    let data = event.u64;
+    let task_ptr = (data & 0xFFFF_FFFF) as usize;
+    let task = GPtr(task_ptr as *mut RunroutineStruct);
+
+    local.push(task);
   }
 }
 
 // ################################################################################################################################################################
-fn scheduler_loop(id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
+fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
   let mut sched_rsp: usize = 0;
-  let peers: Vec<Stealer<GPtr>> = stealers.iter().filter(|s| s.id != id).map(|s| s.stealer.clone()).collect();
+  let peers: Vec<Stealer<GPtr>> = stealers.iter().filter(|s| s.id != debug_id).map(|s| s.stealer.clone()).collect();
+  let ep_fd = unsafe { epoll_create1(0) };
 
-  HANDLES.push(thread::current());
-  LOCAL_WORKER.with(|w| w.set(&local as *const Worker<GPtr>));
+  if ep_fd < 0 {
+    eprintln!("❌ create_epoll_error");
+  } else {
+    EPOLL_FD.with(|fd| fd.set(ep_fd));
+  }
+  GLOBAL_MACHINES.push(thread::current());
+  WORKER.with(|w| w.set(&local as *const Worker<GPtr>));
 
   loop {
     let tick = TICK_COUNT.with(|t| {
@@ -282,6 +355,8 @@ fn scheduler_loop(id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       t.set(next);
       next
     });
+    let sleep = get_ready_timers(&local);
+    // eprintln!("✅ {}sched: ID: {} MIN_TIMEOUT: {}{} 🔥", GREEN, debug_id, sleep, NC);
 
     if let Some(task) = if tick.is_multiple_of(RR_TICK_COUNT) {
       GLOBAL_QUEUE.steal_batch_and_pop(&local).success().or_else(|| local.pop()).or_else(|| { peers.iter().find_map(|s| s.steal().success()) })
@@ -296,65 +371,29 @@ fn scheduler_loop(id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
         swap_stack(&mut sched_rsp, (*ptask).rsp);
         CURRENT_TASK.with(|c| c.set(std::ptr::null_mut()));
 
-        eprintln!("sched: {} resumed_successfully. TICK: {}", id, tick);
+        eprintln!("sched: ID: {} resumed_successfully. TICK: {}", debug_id, tick);
 
         if 0 == (*ptask).rsp {
-          eprintln!("✅ sched: {} task_dropped. TICK: {} 🔥", id, tick);
+          eprintln!("✅ {}sched: ID: {} task_dropped. TICK: {}{} 🔥", GREEN, debug_id, tick, NC);
           let _ = Box::from_raw(ptask);
         }
       }
+
+      if sleep > 0 {
+        thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
+        eprintln!("sched: ID: {} unparked. TICK: {}", debug_id, tick);
+      }
     } else {
-      if *EPOLL_FD < 0 { continue; }
+      handle_event(ep_fd, &local);
 
-      let mut events: [epoll_event; 16] = unsafe { std::mem::zeroed() };
-      let n = unsafe { epoll_wait(*EPOLL_FD, events.as_mut_ptr(), 16, 1) };
-
-      if n > 0 {
-        let mut lock = match WAITING_TASKS.lock() {
-          Ok(guard) => guard,
-          Err(poisoned) => poisoned.into_inner(),
-        };
-
-        for event in events.iter().take(n as usize) {
-          let fd = event.u64 as i32;
-
-          if let Some(t_ptr) = lock.remove(&fd) {
-            unsafe { epoll_ctl(*EPOLL_FD, EPOLL_CTL_DEL, fd, std::ptr::null_mut()); }
-            GLOBAL_QUEUE.push(t_ptr);
-
-            if let Some(h) = HANDLES.pop() {
-              h.unpark();
-              HANDLES.push(h);
-            }
-          }
-        }
+      if sleep > 0 {
+        thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
+        //                                                  //   1.0   0.1   0:00.76 zero
+        eprintln!("sched: ID: {} NO_TASKS: unparked. TICK: {}", debug_id, tick);
+      } else {
+        eprintln!("sched: ID: {} NO_TASKS: parked. TICK: {}", debug_id, tick);
+        thread::park();
       }
-
-      if let Ok(mut lock) = TIMERS.lock() && let Some(timer_task) = lock.peek() && Instant::now() > timer_task.when {
-        let t_task = lock.pop();
-        drop(lock);
-
-        if let Some(timer_task) = t_task {
-          unsafe {
-            let ptask = timer_task.task.0;
-
-            CURRENT_TASK.with(|c| c.set(ptask));
-            SCHED_RSP.with(|r| r.set(&mut sched_rsp as *mut usize as usize));
-            swap_stack(&mut sched_rsp, (*ptask).rsp);
-            CURRENT_TASK.with(|c| c.set(std::ptr::null_mut()));
-            eprintln!("sched: {} timer_resumed_successfully. TICK: {}", id, tick);
-
-            if 0 == (*ptask).rsp {
-              eprintln!("✅ sched: {} task_dropped. TICK: {} 🔥", id, tick);
-              let _ = Box::from_raw(ptask);
-            }
-          }
-        }
-        continue;
-      }
-      // thread::park_timeout(Duration::from_millis(10)); //  %CPU  %MEM     TIME+ COMMAND
-      //                                                  //   1.0   0.1   0:00.76 zero
-      thread::park();
     }
   }
 }

@@ -1,5 +1,5 @@
 use std::{thread};
-use runroutines::rr::runroutines::{build_runtime, back_yield, RunroutineStruct};
+use runroutines::rr::runroutines::{build_runtime, arbit_yield, RunroutineStruct};
 
 extern "C" fn task1(data: *mut ()) {
   // thread::sleep(std::time::Duration::from_millis(1000));
@@ -9,7 +9,7 @@ extern "C" fn task1(data: *mut ()) {
     println!("⚠️  TASK_1: {}", msg);
 
     if i % 5 == 0 {
-      back_yield();
+      arbit_yield();
     }
   }
 }
@@ -19,7 +19,7 @@ extern "C" fn task2(_: *mut ()) {
   for i in 1..10 {
     eprintln!("⚠️  TASK_2");
     if i % 5 == 0 {
-      back_yield();
+      arbit_yield();
     }
   }
 }

@@ -1,6 +1,6 @@
-use std::{cell, ptr, mem, thread, time::{Instant, Duration}, sync::{Arc, Once}, collections::BinaryHeap, cmp::Ordering, io::{Error as IoError}};
-use crossbeam_deque::{Injector, Worker, Stealer/*, Steal*/};
-use crossbeam_queue::SegQueue;
+use std::{cell, ptr, mem, thread, time::{Instant, Duration}, collections::BinaryHeap, cmp::Ordering as CmpOrdering, io::{Error as IoError}};
+use std::sync::{Arc, Once, OnceLock, atomic::{AtomicU64, Ordering}};
+use crossbeam_deque::{Injector, Worker, Stealer};
 use libc::{epoll_wait, epoll_event, epoll_create1, epoll_ctl, /*EPOLL_CTL_DEL, */EPOLL_CTL_ADD, EPOLLIN, read, EAGAIN};
 
 pub const NC: &str = "\x1b[0m"; // NO_COLOR
@@ -18,7 +18,13 @@ type TaskFn = unsafe extern "C" fn(*mut ());
 
 const STACK_SIZE: usize = 1024 * 1024;
 const RR_THREADS_COUNT: usize = 4;
+const WORKERS_COUNT_MAX: usize = 64;
 const RR_TICK_COUNT: u32 = 61;
+
+struct Registry {
+  idle_mask: AtomicU64,
+  handles: [OnceLock<thread::Thread>; WORKERS_COUNT_MAX],
+}
 
 #[allow(unused)]
 #[repr(C)]
@@ -60,27 +66,32 @@ struct TimerTask {
   when: Instant,
   task: GPtr,
 }
+// ################################################################################################################################################################
+impl Eq for TimerTask {}
 
 impl PartialEq for TimerTask {
   fn eq(&self, other: &Self) -> bool { self.when == other.when }
 }
-impl Eq for TimerTask {}
 
 impl Ord for TimerTask {
-  fn cmp(&self, other: &Self) -> Ordering { other.when.cmp(&self.when) }
+  fn cmp(&self, other: &Self) -> CmpOrdering { other.when.cmp(&self.when) }
 }
 
 impl PartialOrd for TimerTask {
-  fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+  fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> { Some(self.cmp(other)) }
 }
+// ################################################################################################################################################################
+
 static RUNTIME_INIT: Once = Once::new();
 static GLOBAL_QUEUE: once_cell::sync::Lazy<Injector<GPtr>> = once_cell::sync::Lazy::new(Injector::new);
-static GLOBAL_MACHINES: once_cell::sync::Lazy<SegQueue<thread::Thread>> = once_cell::sync::Lazy::new(SegQueue::new);
+static REGISTRY: Registry = Registry { idle_mask: AtomicU64::new(0), handles: [const { OnceLock::new() }; WORKERS_COUNT_MAX] };
 
 thread_local! {
   static SCHED_RSP: cell::Cell<usize> = const { cell::Cell::new(0) };
   static CURRENT_TASK: cell::Cell<*mut RunroutineStruct> = const { cell::Cell::new(ptr::null_mut()) };
   static WORKER: cell::Cell<*const Worker<GPtr>> = const { cell::Cell::new(ptr::null()) };
+  static WORKER_STATE: cell::Cell<usize> = const { cell::Cell::new(usize::MAX) };
+
   static TICK_COUNT: cell::Cell<u32> = const { cell::Cell::new(0) };
   static TIMERS: cell::RefCell<BinaryHeap<TimerTask>> = const { cell::RefCell::new(BinaryHeap::new()) };
   static EPOLL_FD: cell::Cell<i32> = const { cell::Cell::new(-1) };
@@ -93,6 +104,31 @@ macro_rules! rr_println {
     // sleep_yield(1);
     arbit_yield();
   }};
+}
+
+// ################################################################################################################################################################
+fn register_worker(id: usize) {
+  WORKER_STATE.with(|w| w.set(id));
+  REGISTRY.idle_mask.fetch_or(1 << id, Ordering::Release);
+  let _ = REGISTRY.handles[id].set(thread::current());
+}
+
+// ################################################################################################################################################################
+fn set_thread_idle() {
+  let id = WORKER_STATE.with(|w| w.get());
+
+  if id < WORKERS_COUNT_MAX {
+    REGISTRY.idle_mask.fetch_or(1 << id, Ordering::Release);
+  }
+}
+
+// ################################################################################################################################################################
+fn set_thread_busy() {
+  let id = WORKER_STATE.with(|w| w.get());
+
+  if id < WORKERS_COUNT_MAX {
+    REGISTRY.idle_mask.fetch_and(! (1 << id), Ordering::Release);
+  }
 }
 
 // ################################################################################################################################################################
@@ -111,16 +147,27 @@ pub fn build_runtime(mut n: usize) {
     }
     let shared_stealers = Arc::new(stealers);
 
-    for i in 0..n {
+    for id in 0..n {
       let local = workers.remove(0);
       let s_clone = Arc::clone(&shared_stealers);
 
       thread::spawn(move || {
-        schedule(i, s_clone, local);
+        schedule(id, s_clone, local);
       });
     }
     eprintln!("🚀 {}RunRoutines runtime started with {} worker threads{} 🔥", GREEN, n, NC);
   });
+}
+
+// ################################################################################################################################################################
+unsafe extern "C" { fn swap_stack(old_sp: *mut usize, new_sp: usize); }
+
+// ################################################################################################################################################################
+#[unsafe(no_mangle)]
+unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
+  eprintln!("shim: started");
+  unsafe { func(data); }
+  eprintln!("shim: completed");
 }
 
 // ################################################################################################################################################################
@@ -245,23 +292,24 @@ impl RunroutineStruct {
 
       eprintln!("add: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
 
-      if let Some(t) = GLOBAL_MACHINES.pop() {
-        t.unpark();
-        GLOBAL_MACHINES.push(t);
+      let mask = REGISTRY.idle_mask.load(Ordering::Acquire);
+
+      if 0 != mask {
+        let id = mask.trailing_zeros() as usize;
+
+        if id < WORKERS_COUNT_MAX {
+          let old_mask = REGISTRY.idle_mask.fetch_and(!(1 << id), Ordering::SeqCst);
+
+          if 0 != (old_mask & (1 << id)) && let Some(t) = REGISTRY.handles[id].get() {
+            eprintln!("{}add: ID: {} unparked{}", GREEN, id, NC);
+            t.unpark();
+          }
+        }
+      } else {
+        eprintln!("{}add: mask_isnull: REG_COUNT: {}{}", RED, REGISTRY.handles.len(), NC);
       }
     }
   }
-}
-
-// ################################################################################################################################################################
-unsafe extern "C" { fn swap_stack(old_sp: *mut usize, new_sp: usize); }
-
-// ################################################################################################################################################################
-#[unsafe(no_mangle)]
-unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
-  eprintln!("shim: started");
-  unsafe { func(data); }
-  eprintln!("shim: completed");
 }
 
 /// # Safety
@@ -309,7 +357,7 @@ fn get_ready_timers(local: &Worker<GPtr>) -> u64 {
         if next.when <= now {
           0
         } else {
-          next.when.saturating_duration_since(now).as_millis() as u64 + 1
+          (next.when.saturating_duration_since(now).as_millis() as u64).max(1)
         }
       }
       None => 0,
@@ -341,11 +389,11 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
   let ep_fd = unsafe { epoll_create1(0) };
 
   if ep_fd < 0 {
-    eprintln!("❌ create_epoll_error");
+    eprintln!("❌ {}create_epoll_error{}", RED, NC);
   } else {
     EPOLL_FD.with(|fd| fd.set(ep_fd));
   }
-  GLOBAL_MACHINES.push(thread::current());
+  register_worker(debug_id);
   WORKER.with(|w| w.set(&local as *const Worker<GPtr>));
 
   loop {
@@ -365,6 +413,7 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       unsafe {
         let ptask = task.0;
 
+        set_thread_busy();
         CURRENT_TASK.with(|c| c.set(ptask));
         SCHED_RSP.with(|r| r.set(&mut sched_rsp as *mut usize as usize));
         swap_stack(&mut sched_rsp, (*ptask).rsp);
@@ -389,10 +438,18 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
         //                                                  //   1.0   0.1   0:00.76 zero
-        eprintln!("sched: ID: {} NO_TASKS: unparked. TICK: {}", debug_id, tick);
+        eprintln!("{}sched: ID: {} NO_TASKS: unparked. TICK: {}{}", DRED, debug_id, tick, NC);
       } else {
-        eprintln!("sched: ID: {} NO_TASKS: parked. TICK: {}", debug_id, tick);
-        thread::park();
+        eprintln!("{}sched: ID: {} NO_TASKS: parked. TICK: {}{}", RED, debug_id, tick, NC);
+
+        set_thread_idle();
+
+        if sleep > 0 {
+          thread::park_timeout(Duration::from_millis(sleep));
+        } else {
+          thread::park();
+        }
+        set_thread_busy();
       }
     }
   }

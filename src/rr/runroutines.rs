@@ -1,4 +1,4 @@
-use std::{thread, time::{Instant, Duration}, sync::{Arc, Once}, collections::BinaryHeap, cmp::Ordering};//, atomic::{AtomicUsize, Ordering}}};
+use std::{cell, ptr, mem, thread, time::{Instant, Duration}, sync::{Arc, Once}, collections::BinaryHeap, cmp::Ordering, io::{Error as IoError}};
 use crossbeam_deque::{Injector, Worker, Stealer/*, Steal*/};
 use crossbeam_queue::SegQueue;
 use libc::{epoll_wait, epoll_event, epoll_create1, epoll_ctl, /*EPOLL_CTL_DEL, */EPOLL_CTL_ADD, EPOLLIN, read, EAGAIN};
@@ -18,7 +18,7 @@ type TaskFn = unsafe extern "C" fn(*mut ());
 
 const STACK_SIZE: usize = 1024 * 1024;
 const RR_THREADS_COUNT: usize = 4;
-const RR_TICK_COUNT: u32 = 4;//61;
+const RR_TICK_COUNT: u32 = 61;
 
 #[allow(unused)]
 #[repr(C)]
@@ -78,12 +78,12 @@ static GLOBAL_QUEUE: once_cell::sync::Lazy<Injector<GPtr>> = once_cell::sync::La
 static GLOBAL_MACHINES: once_cell::sync::Lazy<SegQueue<thread::Thread>> = once_cell::sync::Lazy::new(SegQueue::new);
 
 thread_local! {
-  static SCHED_RSP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-  static CURRENT_TASK: std::cell::Cell<*mut RunroutineStruct> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-  static WORKER: std::cell::Cell<*const Worker<GPtr>> = const { std::cell::Cell::new(std::ptr::null()) };
-  static TICK_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-  static TIMERS: std::cell::RefCell<BinaryHeap<TimerTask>> = const { std::cell::RefCell::new(BinaryHeap::new()) };
-  static EPOLL_FD: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+  static SCHED_RSP: cell::Cell<usize> = const { cell::Cell::new(0) };
+  static CURRENT_TASK: cell::Cell<*mut RunroutineStruct> = const { cell::Cell::new(ptr::null_mut()) };
+  static WORKER: cell::Cell<*const Worker<GPtr>> = const { cell::Cell::new(ptr::null()) };
+  static TICK_COUNT: cell::Cell<u32> = const { cell::Cell::new(0) };
+  static TIMERS: cell::RefCell<BinaryHeap<TimerTask>> = const { cell::RefCell::new(BinaryHeap::new()) };
+  static EPOLL_FD: cell::Cell<i32> = const { cell::Cell::new(-1) };
 }
 
 #[macro_export]
@@ -133,7 +133,7 @@ pub fn async_read(fd: i32, buf: &mut [u8]) -> isize {
     if n >= 0 {
       return n;
     }
-    let err = std::io::Error::last_os_error();
+    let err = IoError::last_os_error();
 
     match err.raw_os_error() {
       Some(EAGAIN) /*| Some(EWOULDBLOCK) */ => {
@@ -160,7 +160,7 @@ pub fn sleep_yield(ms: u64) {
       task: GPtr(ptask),
     });
   });
-  eprintln!("sleep_yield: pushed: {:?}", wake_at);
+  eprintln!("{}sleep_yield: pushed: {:?}{}", YELLOW, wake_at, NC);
 
   unsafe {
     let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
@@ -183,7 +183,7 @@ pub fn arbit_yield() {
 
       if ! ptr.is_null() {
         (*ptr).push(GPtr(ptask));
-        eprintln!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
+        // eprintln!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
       } else {
         GLOBAL_QUEUE.push(GPtr(ptask));
         eprintln!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
@@ -309,7 +309,7 @@ fn get_ready_timers(local: &Worker<GPtr>) -> u64 {
         if next.when <= now {
           0
         } else {
-          next.when.saturating_duration_since(now).as_millis() as u64
+          next.when.saturating_duration_since(now).as_millis() as u64 + 1
         }
       }
       None => 0,
@@ -319,14 +319,13 @@ fn get_ready_timers(local: &Worker<GPtr>) -> u64 {
 
 // ################################################################################################################################################################
 fn handle_event(epfd: i32, local: &Worker<GPtr>) {
-  let mut events: [epoll_event; 64] = unsafe { std::mem::zeroed() };
+  let mut events: [epoll_event; 64] = unsafe { mem::zeroed() };
 
   let n = unsafe {
     epoll_wait(epfd, events.as_mut_ptr(), 64, 0)
   };
 
   for event in events.iter().take(n.max(0) as usize) {
-  // for i in 0..n.max(0) as usize {
     let data = event.u64;
     let task_ptr = (data & 0xFFFF_FFFF) as usize;
     let task = GPtr(task_ptr as *mut RunroutineStruct);
@@ -369,9 +368,9 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
         CURRENT_TASK.with(|c| c.set(ptask));
         SCHED_RSP.with(|r| r.set(&mut sched_rsp as *mut usize as usize));
         swap_stack(&mut sched_rsp, (*ptask).rsp);
-        CURRENT_TASK.with(|c| c.set(std::ptr::null_mut()));
+        CURRENT_TASK.with(|c| c.set(ptr::null_mut()));
 
-        eprintln!("sched: ID: {} resumed_successfully. TICK: {}", debug_id, tick);
+        eprint!("\rsched: ID: {} resumed_successfully. TICK: {}", debug_id, tick);
 
         if 0 == (*ptask).rsp {
           eprintln!("✅ {}sched: ID: {} task_dropped. TICK: {}{} 🔥", GREEN, debug_id, tick, NC);
@@ -381,6 +380,7 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
 
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
+        //                                                  //   1.0   0.1   0:00.76 zero
         eprintln!("sched: ID: {} unparked. TICK: {}", debug_id, tick);
       }
     } else {

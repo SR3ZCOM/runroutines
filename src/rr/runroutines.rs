@@ -109,7 +109,7 @@ macro_rules! rr_println {
 // ################################################################################################################################################################
 fn register_worker(id: usize) {
   WORKER_STATE.with(|w| w.set(id));
-  REGISTRY.idle_mask.fetch_or(1 << id, Ordering::Release);
+
   let _ = REGISTRY.handles[id].set(thread::current());
 }
 
@@ -155,7 +155,7 @@ pub fn build_runtime(mut n: usize) {
         schedule(id, s_clone, local);
       });
     }
-    eprintln!("🚀 {}RunRoutines runtime started with {} worker threads{} 🔥", GREEN, n, NC);
+    log::debug!("🚀 {}RunRoutines runtime started with {} worker threads{} 🔥", GREEN, n, NC);
   });
 }
 
@@ -165,9 +165,9 @@ unsafe extern "C" { fn swap_stack(old_sp: *mut usize, new_sp: usize); }
 // ################################################################################################################################################################
 #[unsafe(no_mangle)]
 unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
-  eprintln!("shim: started");
+  log::debug!("shim: started");
   unsafe { func(data); }
-  eprintln!("shim: completed");
+  log::debug!("shim: completed");
 }
 
 // ################################################################################################################################################################
@@ -207,7 +207,7 @@ pub fn sleep_yield(ms: u64) {
       task: GPtr(ptask),
     });
   });
-  eprintln!("{}sleep_yield: pushed: {:?}{}", YELLOW, wake_at, NC);
+  log::debug!("{}sleep_yield: pushed: {:?}{}", YELLOW, wake_at, NC);
 
   unsafe {
     let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
@@ -230,10 +230,10 @@ pub fn arbit_yield() {
 
       if ! ptr.is_null() {
         (*ptr).push(GPtr(ptask));
-        // eprintln!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
+        // log::debug!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
       } else {
         GLOBAL_QUEUE.push(GPtr(ptask));
-        eprintln!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
+        log::debug!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
       }
     });
     let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
@@ -290,7 +290,7 @@ impl RunroutineStruct {
       }
       GLOBAL_QUEUE.push(GPtr(Box::into_raw(Box::new(RunroutineStruct { rsp: sp as usize, stack }))));
 
-      eprintln!("add: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
+      log::debug!("add: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
 
       let mask = REGISTRY.idle_mask.load(Ordering::Acquire);
 
@@ -301,12 +301,10 @@ impl RunroutineStruct {
           let old_mask = REGISTRY.idle_mask.fetch_and(!(1 << id), Ordering::SeqCst);
 
           if 0 != (old_mask & (1 << id)) && let Some(t) = REGISTRY.handles[id].get() {
-            eprintln!("{}add: ID: {} unparked{}", GREEN, id, NC);
+            log::debug!("{}add: ID: {} unparked{}", GREEN, id, NC);
             t.unpark();
           }
         }
-      } else {
-        eprintln!("{}add: mask_isnull: REG_COUNT: {}{}", RED, REGISTRY.handles.len(), NC);
       }
     }
   }
@@ -389,7 +387,7 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
   let ep_fd = unsafe { epoll_create1(0) };
 
   if ep_fd < 0 {
-    eprintln!("❌ {}create_epoll_error{}", RED, NC);
+    log::error!("❌ {}create_epoll_error{}", RED, NC);
   } else {
     EPOLL_FD.with(|fd| fd.set(ep_fd));
   }
@@ -403,7 +401,6 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       next
     });
     let sleep = get_ready_timers(&local);
-    // eprintln!("✅ {}sched: ID: {} MIN_TIMEOUT: {}{} 🔥", GREEN, debug_id, sleep, NC);
 
     if let Some(task) = if tick.is_multiple_of(RR_TICK_COUNT) {
       GLOBAL_QUEUE.steal_batch_and_pop(&local).success().or_else(|| local.pop()).or_else(|| { peers.iter().find_map(|s| s.steal().success()) })
@@ -419,10 +416,10 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
         swap_stack(&mut sched_rsp, (*ptask).rsp);
         CURRENT_TASK.with(|c| c.set(ptr::null_mut()));
 
-        eprint!("\rsched: ID: {} resumed_successfully. TICK: {}", debug_id, tick);
+        // eprint!("\rsched: ID: {} resumed_successfully. TICK: {}", debug_id, tick);
 
         if 0 == (*ptask).rsp {
-          eprintln!("✅ {}sched: ID: {} task_dropped. TICK: {}{} 🔥", GREEN, debug_id, tick, NC);
+          log::debug!("🔥 {}sched: ID: {} task_dropped. TICK: {}{} 🏁", YELLOW, debug_id, tick, NC);
           let _ = Box::from_raw(ptask);
         }
       }
@@ -430,7 +427,7 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
         //                                                  //   1.0   0.1   0:00.76 zero
-        eprintln!("sched: ID: {} unparked. TICK: {}", debug_id, tick);
+        log::debug!("🔥 {}sched: ID: {} TASK: unparked. TICK: {}{}", GREEN, debug_id, tick, NC);
       }
     } else {
       handle_event(ep_fd, &local);
@@ -438,9 +435,9 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
         //                                                  //   1.0   0.1   0:00.76 zero
-        eprintln!("{}sched: ID: {} NO_TASKS: unparked. TICK: {}{}", DRED, debug_id, tick, NC);
+        log::debug!("🔥 {}sched: ID: {} unparked. TICK: {}{}", GREEN, debug_id, tick, NC);
       } else {
-        eprintln!("{}sched: ID: {} NO_TASKS: parked. TICK: {}{}", RED, debug_id, tick, NC);
+        log::debug!("🔥 {}sched: ID: {} parked. TICK: {}{}", RED, debug_id, tick, NC);
 
         set_thread_idle();
 

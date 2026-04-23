@@ -6,30 +6,28 @@ Linux x86_64
 runroutines
 ----------------------------------------------------------------------------------------
 
-extern "C" fn task1(data: *mut ()) {
-  // thread::sleep(std::time::Duration::from_millis(1000));
-  let msg = unsafe { &*(data as *const String) };
+extern "C" fn task1(pdata: *mut ()) {
+  let msg = unsafe { &*(pdata as *const String) };
 
   for i in 1..10 {
-    println!("⚠️  {}MAIN: TASK_1: {}{}", YELLOW, msg, NC);
-
-    if i % 5 == 0 {
-      back_yield();
-    }
+    rr_println!("⚠️  MAIN: {} TASK_1: {}", i, msg);
   }
 }
 
-extern "C" fn task2(_: *mut ()) {
-  // thread::sleep(std::time::Duration::from_millis(500));
-  for i in 1..10 {
-    eprintln!("⚠️  {}MAIN: TASK_2{}", YELLOW, NC);
-    if i % 5 == 0 {
-      back_yield();
+extern "C" fn task2(pdata: *mut ()) {
+  unsafe {
+    let task_st = Box::from_raw(pdata as *mut TaskStruct);
+
+    for i in 1..10 {
+      rr_println!("⚠️  MAIN: {} TASK_2: {}: {}", i, task_st.msg, task_st.id);
     }
   }
 }
-----------------------------------------------------------------------------------------
 
 build_runtime(2);
+
 RunroutineStruct::add(task1, String::from("new_msg"));
+let task_st = TaskStruct { msg: String::from("new_msg_2"), id: 777};
+RunroutineStruct::add(task2, task_st);
+
 ----------------------------------------------------------------------------------------

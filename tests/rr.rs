@@ -1,25 +1,27 @@
 use std::{thread};
-use runroutines::rr::runroutines::{build_runtime, arbit_yield, RunroutineStruct};
+use runroutines::{rr_println, rr::runroutines::{build_runtime, arbit_yield, RunroutineStruct, CYAN, NC}};
 
-extern "C" fn task1(data: *mut ()) {
-  // thread::sleep(std::time::Duration::from_millis(1000));
-  let msg = unsafe { &*(data as *const String) };
+struct TaskStruct{
+  msg: String,
+  id: i32,
+}
+
+// ################################################################################################################################################################
+extern "C" fn task1(pdata: *mut ()) {
+  let msg = unsafe { &*(pdata as *const String) };
 
   for i in 1..10 {
-    println!("⚠️  TASK_1: {}", msg);
-
-    if i % 5 == 0 {
-      arbit_yield();
-    }
+    rr_println!("⚠️  MAIN: {} TASK_1: {}", i, msg);
   }
 }
 
-extern "C" fn task2(_: *mut ()) {
-  // thread::sleep(std::time::Duration::from_millis(500));
-  for i in 1..10 {
-    eprintln!("⚠️  TASK_2");
-    if i % 5 == 0 {
-      arbit_yield();
+// ################################################################################################################################################################
+extern "C" fn task2(pdata: *mut ()) {
+  unsafe {
+    let task_st = Box::from_raw(pdata as *mut TaskStruct);
+
+    for i in 1..10 {
+      rr_println!("⚠️  MAIN: {} TASK_2: {}: {}", i, task_st.msg, task_st.id);
     }
   }
 }
@@ -28,12 +30,12 @@ extern "C" fn task2(_: *mut ()) {
 #[test]
 fn rr_run() {
   log::info!("✅ RR_TEST");
-  build_runtime(1);
-
-  log::info!("✅ RR_TEST: BEFORE_ADD");
 
   RunroutineStruct::add(task1, String::from("new_msg"));
-  RunroutineStruct::add(task2, std::ptr::null_mut::<i32>());
+  let task_st = TaskStruct { msg: String::from("new_msg_2"), id: 777};
+
+  RunroutineStruct::add(task2, task_st);
+  build_runtime(2);
 
   loop {
     thread::sleep(std::time::Duration::from_millis(1));

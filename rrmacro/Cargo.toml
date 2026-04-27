@@ -1,0 +1,16 @@
+[package]
+name = "rrmacro"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+rustc_version = "0.4"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+log = "0.4"
+syn = { version = "2", features = ["full", "visit-mut"] }
+quote = "1"
+proc-macro2 = "1"

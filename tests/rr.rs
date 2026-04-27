@@ -1,5 +1,6 @@
 use std::{thread};
-use runroutines::{rr_println, rr::runroutines::{build_runtime, arbit_yield, RunroutineStruct, CYAN, NC}};
+use runroutines::{rr_println, rr::runroutines::{build_runtime, arbit_yield, RunroutineStruct, CYAN, GREEN, NC}};
+use rrmacro::rr_compliant;
 
 struct TaskStruct{
   msg: String,
@@ -16,6 +17,7 @@ extern "C" fn task1(pdata: *mut ()) {
 }
 
 // ################################################################################################################################################################
+#[rr_compliant]
 extern "C" fn task2(pdata: *mut ()) {
   unsafe {
     let task_st = Box::from_raw(pdata as *mut TaskStruct);
@@ -37,9 +39,8 @@ fn rr_run() {
   RunroutineStruct::add(task2, task_st);
   build_runtime(2);
 
-  loop {
-    thread::sleep(std::time::Duration::from_millis(1));
-  }
+  thread::sleep(std::time::Duration::from_millis(1));
+  println!("🎯 {}RR_TEST_COMPLETED{} 🏁", GREEN, NC);
 }
 
 // ################################################################################################################################################################

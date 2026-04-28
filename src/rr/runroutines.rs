@@ -21,6 +21,7 @@ const RR_THREADS_COUNT: usize = 4;
 const WORKERS_COUNT_MAX: usize = 64;
 const RR_TICK_COUNT: u32 = 61;
 
+#[derive(Debug)]
 struct Registry {
   idle_mask: AtomicU64,
   handles: [OnceLock<thread::Thread>; WORKERS_COUNT_MAX],
@@ -44,6 +45,7 @@ struct Context {
 
 #[allow(unused)]
 #[repr(C)]
+#[derive(Debug)]
 pub struct RunroutineStruct {
   rsp: usize,
   stack: Vec<u8>,
@@ -66,6 +68,7 @@ struct TimerTask {
   when: Instant,
   task: GPtr,
 }
+
 // ################################################################################################################################################################
 impl Eq for TimerTask {}
 
@@ -165,9 +168,9 @@ unsafe extern "C" { fn swap_stack(old_sp: *mut usize, new_sp: usize); }
 // ################################################################################################################################################################
 #[unsafe(no_mangle)]
 unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
-  log::debug!("shim: started");
+  // log::debug!("shim: started");
   unsafe { func(data); }
-  log::debug!("shim: completed");
+  // log::debug!("shim: completed");
 }
 
 // ################################################################################################################################################################
@@ -194,12 +197,14 @@ pub fn async_read(fd: i32, buf: &mut [u8]) -> isize {
 }
 
 // ################################################################################################################################################################
-pub fn sleep_yield(ms: u64) {
+// pub fn sleep_yield(ms: u64) {
+pub fn sleep_yield(duration: Duration) {
   let ptask = CURRENT_TASK.with(|c| c.get());
 
   if ptask.is_null() { return; }
 
-  let wake_at = Instant::now() + Duration::from_millis(ms);
+  // let wake_at = Instant::now() + Duration::from_millis(ms);
+  let wake_at = Instant::now() + duration;
 
   TIMERS.with(|timers| {
     timers.borrow_mut().push(TimerTask {
@@ -233,7 +238,7 @@ pub fn arbit_yield() {
         // log::debug!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
       } else {
         GLOBAL_QUEUE.push(GPtr(ptask));
-        log::debug!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
+        // log::debug!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
       }
     });
     let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
@@ -301,8 +306,8 @@ impl RunroutineStruct {
           let old_mask = REGISTRY.idle_mask.fetch_and(!(1 << id), Ordering::SeqCst);
 
           if 0 != (old_mask & (1 << id)) && let Some(t) = REGISTRY.handles[id].get() {
-            log::debug!("{}add: ID: {} unparked{}", GREEN, id, NC);
             t.unpark();
+            log::debug!("🔥 {}add: ID: {} ready_to_unpark{}", GREEN, id, NC);
           }
         }
       }
@@ -419,7 +424,7 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
         // eprint!("\rsched: ID: {} resumed_successfully. TICK: {}", debug_id, tick);
 
         if 0 == (*ptask).rsp {
-          log::debug!("🔥 {}sched: ID: {} task_dropped. TICK: {}{} 🏁", YELLOW, debug_id, tick, NC);
+          log::debug!("🎯 {}sched: ID: {} task_dropped. TICK: {}{} 🏁", YELLOW, debug_id, tick, NC);
           let _ = Box::from_raw(ptask);
         }
       }
@@ -427,27 +432,22 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
         //                                                  //   1.0   0.1   0:00.76 zero
-        log::debug!("🔥 {}sched: ID: {} TASK: unparked. TICK: {}{}", GREEN, debug_id, tick, NC);
+        log::debug!("🔥 {}sched: ID: {} TASK: unparked. TICK: {}{} 🚀", GREEN, debug_id, tick, NC);
       }
     } else {
       handle_event(ep_fd, &local);
 
+      set_thread_idle();
+      log::debug!("❌ {}sched: ID: {} parked. TICK: {}{} 🏁", RED, debug_id, tick, NC);
+
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
         //                                                  //   1.0   0.1   0:00.76 zero
-        log::debug!("🔥 {}sched: ID: {} unparked. TICK: {}{}", GREEN, debug_id, tick, NC);
       } else {
-        log::debug!("🔥 {}sched: ID: {} parked. TICK: {}{}", RED, debug_id, tick, NC);
-
-        set_thread_idle();
-
-        if sleep > 0 {
-          thread::park_timeout(Duration::from_millis(sleep));
-        } else {
-          thread::park();
-        }
-        set_thread_busy();
+        thread::park();
       }
+      set_thread_busy();
+      log::debug!("🔥 {}sched: ID: {} unparked. TICK: {}{} 🚀", GREEN, debug_id, tick, NC);
     }
   }
 }

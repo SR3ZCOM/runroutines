@@ -1,5 +1,5 @@
 use std::{thread};
-use runroutines::{rr_println, rr::runroutines::{build_runtime, arbit_yield, RunroutineStruct, CYAN, GREEN, NC}};
+use runroutines::{rr_println, rr::runroutines::{build_runtime, arbit_yield, RunroutineStruct, /*CYAN, */GREEN, NC}};
 use rrmacro::rr_compliant;
 
 struct TaskStruct{

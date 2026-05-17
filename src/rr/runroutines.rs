@@ -3,16 +3,7 @@ use std::sync::{Arc, Once, OnceLock, atomic::{AtomicU64, Ordering}};
 use crossbeam_deque::{Injector, Worker, Stealer};
 use libc::{epoll_wait, epoll_event, epoll_create1, epoll_ctl, /*EPOLL_CTL_DEL, */EPOLL_CTL_ADD, EPOLLIN, read, EAGAIN};
 
-pub const NC: &str = "\x1b[0m"; // NO_COLOR
-pub const DRED: &str = "\x1b[31m";
-pub const RED: &str = "\x1b[91m";
-pub const DGREEN: &str = "\x1b[32m";
-pub const GREEN: &str = "\x1b[92m";
-pub const DYELLOW: &str = "\x1b[33m";
-pub const YELLOW: &str = "\x1b[93m";
-pub const MAG: &str = "\x1b[95m";
-pub const DCYAN: &str = "\x1b[36m";
-pub const CYAN: &str = "\x1b[96m";
+use crate::{slog_r, seprint_r, seprint_y, seprint_g, rr::{NC, GREEN, YELLOW, RED, /*DRED, CYAN, DCYAN, DYELLOW*/}};
 
 type TaskFn = unsafe extern "C" fn(*mut ());
 
@@ -135,22 +126,22 @@ fn set_thread_busy() {
 }
 
 // ################################################################################################################################################################
-pub fn build_runtime(mut n: usize) {
+pub fn build_runtime(mut thcount: usize) {
   RUNTIME_INIT.call_once(|| {
-    if 0 == n || n > RR_THREADS_COUNT {
-      n = thread::available_parallelism().map(|n| n.get()).unwrap_or(RR_THREADS_COUNT);
+    if 0 == thcount || thcount > RR_THREADS_COUNT {
+      thcount = thread::available_parallelism().map(|n| n.get()).unwrap_or(RR_THREADS_COUNT);
     }
     let mut stealers = Vec::new();
     let mut workers = Vec::new();
 
-    for i in 0..n {
+    for i in 0..thcount {
       let worker = Worker::new_fifo();
       stealers.push(SharedP { id: i, stealer: worker.stealer() });
       workers.push(worker);
     }
     let shared_stealers = Arc::new(stealers);
 
-    for id in 0..n {
+    for id in 0..thcount {
       let local = workers.remove(0);
       let s_clone = Arc::clone(&shared_stealers);
 
@@ -158,7 +149,7 @@ pub fn build_runtime(mut n: usize) {
         schedule(id, s_clone, local);
       });
     }
-    log::debug!("🚀 {}RunRoutines runtime started with {} worker threads{} 🔥", GREEN, n, NC);
+    eprintln!("✅ {}RUN_ROUTINES: BUILD_RUNTIME SPAWNED {} THREADS{} ⭐", GREEN, thcount, NC);
   });
 }
 
@@ -168,9 +159,9 @@ unsafe extern "C" { fn swap_stack(old_sp: *mut usize, new_sp: usize); }
 // ################################################################################################################################################################
 #[unsafe(no_mangle)]
 unsafe extern "C" fn shim(func: TaskFn, data: *mut ()) {
-  // log::debug!("shim: started");
+  // eprintln!("shim: started");
   unsafe { func(data); }
-  // log::debug!("shim: completed");
+  // eprintln!("shim: completed");
 }
 
 // ################################################################################################################################################################
@@ -212,7 +203,7 @@ pub fn sleep_yield(duration: Duration) {
       task: GPtr(ptask),
     });
   });
-  log::debug!("{}sleep_yield: pushed: {:?}{}", YELLOW, wake_at, NC);
+  eprintln!("{}sleep_yield: pushed: {:?}{}", YELLOW, wake_at, NC);
 
   unsafe {
     let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
@@ -235,10 +226,10 @@ pub fn arbit_yield() {
 
       if ! ptr.is_null() {
         (*ptr).push(GPtr(ptask));
-        // log::debug!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
+        // eprintln!("arbit_yield: pushed_to_local: COUNT: {}", (*ptr).len());
       } else {
         GLOBAL_QUEUE.push(GPtr(ptask));
-        // log::debug!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
+        // eprintln!("arbit_yield: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
       }
     });
     let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
@@ -273,6 +264,8 @@ pub fn wait_for_fd(fd: i32) {
 // ################################################################################################################################################################
 impl RunroutineStruct {
   pub fn add<T>(func: TaskFn, data: T) {
+    const LOG_VALUE: &str = "RR_ADD";
+
     let mut stack = vec![0u8; STACK_SIZE];
     let top = unsafe { stack.as_mut_ptr().add(stack.len()) as *mut usize };
     let pdata = Box::into_raw(Box::new(data)) as *mut ();
@@ -295,19 +288,17 @@ impl RunroutineStruct {
       }
       GLOBAL_QUEUE.push(GPtr(Box::into_raw(Box::new(RunroutineStruct { rsp: sp as usize, stack }))));
 
-      log::debug!("add: pushed_to_global: COUNT: {}", GLOBAL_QUEUE.len());
-
       let mask = REGISTRY.idle_mask.load(Ordering::Acquire);
 
       if 0 != mask {
         let id = mask.trailing_zeros() as usize;
 
         if id < WORKERS_COUNT_MAX {
-          let old_mask = REGISTRY.idle_mask.fetch_and(!(1 << id), Ordering::SeqCst);
+          let old_mask = REGISTRY.idle_mask.fetch_and(! (1 << id), Ordering::SeqCst);
 
           if 0 != (old_mask & (1 << id)) && let Some(t) = REGISTRY.handles[id].get() {
             t.unpark();
-            log::debug!("🔥 {}add: ID: {} ready_to_unpark{}", GREEN, id, NC);
+            seprint_g!("🔥 ID: {} ready_to_unpark 🚀", id);
           }
         }
       }
@@ -387,12 +378,14 @@ fn handle_event(epfd: i32, local: &Worker<GPtr>) {
 
 // ################################################################################################################################################################
 fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
+  const LOG_VALUE: &str = "RR_SCHED";
+
   let mut sched_rsp: usize = 0;
   let peers: Vec<Stealer<GPtr>> = stealers.iter().filter(|s| s.id != debug_id).map(|s| s.stealer.clone()).collect();
   let ep_fd = unsafe { epoll_create1(0) };
 
   if ep_fd < 0 {
-    log::error!("❌ {}create_epoll_error{}", RED, NC);
+    slog_r!(error, "create_epoll_error");
   } else {
     EPOLL_FD.with(|fd| fd.set(ep_fd));
   }
@@ -424,7 +417,7 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
         // eprint!("\rsched: ID: {} resumed_successfully. TICK: {}", debug_id, tick);
 
         if 0 == (*ptask).rsp {
-          log::debug!("🎯 {}sched: ID: {} task_dropped. TICK: {}{} 🏁", YELLOW, debug_id, tick, NC);
+          seprint_y!("🎯 ID: {} task_dropped. TICK: {} 🏁", debug_id, tick);
           let _ = Box::from_raw(ptask);
         }
       }
@@ -432,13 +425,13 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
         //                                                  //   1.0   0.1   0:00.76 zero
-        log::debug!("🔥 {}sched: ID: {} TASK: unparked. TICK: {}{} 🚀", GREEN, debug_id, tick, NC);
+        seprint_g!("🔥 ID: {} TASK: unparked. TICK: {} 💥", debug_id, tick);
       }
     } else {
       handle_event(ep_fd, &local);
 
       set_thread_idle();
-      log::debug!("❌ {}sched: ID: {} parked. TICK: {}{} 🏁", RED, debug_id, tick, NC);
+      seprint_r!("🔥 ID: {} parked. TICK: {} SLEEP: {} 🏁", debug_id, tick, sleep);
 
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
@@ -447,7 +440,7 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
         thread::park();
       }
       set_thread_busy();
-      log::debug!("🔥 {}sched: ID: {} unparked. TICK: {}{} 🚀", GREEN, debug_id, tick, NC);
+      seprint_g!("🔥 ID: {} unparked. TICK: {} 💥", debug_id, tick);
     }
   }
 }

@@ -1,7 +1,7 @@
 use std::{cell, ptr, mem, thread, time::{Instant, Duration}, collections::BinaryHeap, cmp::Ordering as CmpOrdering, io::{Error as IoError}};
 use std::sync::{Arc, Once, OnceLock, atomic::{AtomicU64, Ordering}};
 use crossbeam_deque::{Injector, Worker, Stealer};
-use libc::{epoll_wait, epoll_event, epoll_create1, epoll_ctl, /*EPOLL_CTL_DEL, */EPOLL_CTL_ADD, EPOLLIN, read, EAGAIN};
+use libc::{epoll_wait, epoll_event, epoll_create1, epoll_ctl, /*EPOLL_CTL_DEL,*/EPOLL_CTL_ADD, EPOLL_CTL_MOD, EPOLLIN, read, EAGAIN};
 
 use crate::{slog_r, seprint_r, seprint_y, seprint_g, rr::{NC, GREEN, YELLOW, RED, /*DRED, CYAN, DCYAN, DYELLOW*/}};
 
@@ -10,7 +10,9 @@ type TaskFn = unsafe extern "C" fn(*mut ());
 const STACK_SIZE: usize = 1024 * 1024;
 const RR_THREADS_COUNT: usize = 4;
 const WORKERS_COUNT_MAX: usize = 64;
-const RR_TICK_COUNT: u32 = 61;
+const EVENTS_COUNT_MAX: usize = 64;
+const RR_TICK_COUNT: i32 = 61;
+const DEFAULT_TIMEOUT: i32 = 0;
 
 #[derive(Debug)]
 struct Registry {
@@ -86,7 +88,7 @@ thread_local! {
   static WORKER: cell::Cell<*const Worker<GPtr>> = const { cell::Cell::new(ptr::null()) };
   static WORKER_STATE: cell::Cell<usize> = const { cell::Cell::new(usize::MAX) };
 
-  static TICK_COUNT: cell::Cell<u32> = const { cell::Cell::new(0) };
+  static TICK_QUOTA: cell::Cell<i32> = const { cell::Cell::new(RR_TICK_COUNT) };
   static TIMERS: cell::RefCell<BinaryHeap<TimerTask>> = const { cell::RefCell::new(BinaryHeap::new()) };
   static EPOLL_FD: cell::Cell<i32> = const { cell::Cell::new(-1) };
 }
@@ -252,7 +254,14 @@ pub fn wait_for_fd(fd: i32) {
   };
 
   unsafe {
-    epoll_ctl(fd, EPOLL_CTL_ADD, fd, &mut ev);
+    EPOLL_FD.with(|efd| {
+      let epfd = efd.get();
+      let rc = epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &mut ev);
+
+      if rc < 0 {
+        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut ev);
+      }
+    });
     let psched_rsp = SCHED_RSP.with(|r| r.get()) as *mut usize;
 
     if ! psched_rsp.is_null() {
@@ -329,13 +338,8 @@ fn get_ready_timers(local: &Worker<GPtr>) -> u64 {
     let mut timers = timers.borrow_mut();
     let now = Instant::now();
 
-    loop {
-      let expired = match timers.peek() {
-        Some(t) => t.when <= now,
-        None => false,
-      };
-
-      if ! expired {
+    while let Some(t) = timers.peek() {
+      if t.when > now {
         break;
       }
 
@@ -348,11 +352,7 @@ fn get_ready_timers(local: &Worker<GPtr>) -> u64 {
 
     match timers.peek() {
       Some(next) => {
-        if next.when <= now {
-          0
-        } else {
-          (next.when.saturating_duration_since(now).as_millis() as u64).max(1)
-        }
+        next.when.saturating_duration_since(now).as_millis().max(1) as u64
       }
       None => 0,
     }
@@ -361,16 +361,14 @@ fn get_ready_timers(local: &Worker<GPtr>) -> u64 {
 
 // ################################################################################################################################################################
 fn handle_event(epfd: i32, local: &Worker<GPtr>) {
-  let mut events: [epoll_event; 64] = unsafe { mem::zeroed() };
+  let mut events: [epoll_event; EVENTS_COUNT_MAX] = unsafe { mem::zeroed() };
 
   let n = unsafe {
-    epoll_wait(epfd, events.as_mut_ptr(), 64, 0)
+    epoll_wait(epfd, events.as_mut_ptr(), EVENTS_COUNT_MAX as i32, DEFAULT_TIMEOUT)
   };
 
   for event in events.iter().take(n.max(0) as usize) {
-    let data = event.u64;
-    let task_ptr = (data & 0xFFFF_FFFF) as usize;
-    let task = GPtr(task_ptr as *mut RunroutineStruct);
+    let task = GPtr(event.u64 as *mut RunroutineStruct);
 
     local.push(task);
   }
@@ -393,17 +391,26 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
   WORKER.with(|w| w.set(&local as *const Worker<GPtr>));
 
   loop {
-    let tick = TICK_COUNT.with(|t| {
-      let next = t.get().wrapping_add(1);
-      t.set(next);
-      next
-    });
-    let sleep = get_ready_timers(&local);
+    let tick = TICK_QUOTA.with(|t| {
+      let mut current = t.get();
 
-    if let Some(task) = if tick.is_multiple_of(RR_TICK_COUNT) {
-      GLOBAL_QUEUE.steal_batch_and_pop(&local).success().or_else(|| local.pop()).or_else(|| { peers.iter().find_map(|s| s.steal().success()) })
+      if current > 0 {
+        t.set(current - 1);
+      } else {
+        current = 0;
+      }
+      current
+    });
+
+    if let Some(task) = if 0 == tick {
+      handle_event(ep_fd, &local);
+
+      let _ = get_ready_timers(&local);
+      TICK_QUOTA.with(|t| t.set(RR_TICK_COUNT));
+      GLOBAL_QUEUE.steal_batch_and_pop(&local).success().or_else(|| local.pop()).or_else(|| { peers.iter().rev().find_map(|s| s.steal().success()) })
+      // GLOBAL_QUEUE.steal_batch_and_pop(&local).success().or_else(|| local.pop())
     } else {
-      local.pop().or_else(|| GLOBAL_QUEUE.steal_batch_and_pop(&local).success()).or_else(|| { peers.iter().find_map(|s| s.steal().success()) })
+      local.pop().or_else(|| GLOBAL_QUEUE.steal_batch_and_pop(&local).success()).or_else(|| { peers.iter().rev().find_map(|s| s.steal().success()) })
     } {
       unsafe {
         let ptask = task.0;
@@ -421,22 +428,16 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
           let _ = Box::from_raw(ptask);
         }
       }
+    } else {
+      set_thread_idle();
+      let sleep = get_ready_timers(&local);
 
       if sleep > 0 {
         thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
         //                                                  //   1.0   0.1   0:00.76 zero
         seprint_g!("🔥 ID: {} TASK: unparked. TICK: {} 💥", debug_id, tick);
-      }
-    } else {
-      handle_event(ep_fd, &local);
-
-      set_thread_idle();
-      seprint_r!("🔥 ID: {} parked. TICK: {} SLEEP: {} 🏁", debug_id, tick, sleep);
-
-      if sleep > 0 {
-        thread::park_timeout(Duration::from_millis(sleep)); //  %CPU  %MEM     TIME+ COMMAND
-        //                                                  //   1.0   0.1   0:00.76 zero
-      } else {
+      } else if local.is_empty() {
+        seprint_r!("🔥 ID: {} parked. TICK: {} 🏁", debug_id, tick);
         thread::park();
       }
       set_thread_busy();
@@ -444,5 +445,16 @@ fn schedule(debug_id: usize, stealers: Arc<Vec<SharedP>>, local: Worker<GPtr>) {
     }
   }
 }
+
+/*
+Reactor:
+    fd -> wait_queues
+Scheduler:
+    runnable_tasks
+epoll:
+    readiness_events
+reactor:
+    readiness_events -> runnable_tasks
+*/
 
 // ################################################################################################################################################################
